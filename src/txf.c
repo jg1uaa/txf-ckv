@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: WTFPL
 
+#include <basic.h>
 #include <bstdio.h>
 #include <bstring.h>
+#include <bstdlib.h>
 #include <btron/file.h>
 #include <btron/bsocket.h>
 #include <tcode.h>
@@ -21,6 +23,18 @@ struct txf_header {
 	B filename_term;		// must be zero
 	B unused[3];
 } __attribute__((packed));
+
+struct txf_workingset {
+	VP (*init)(TC *arg);
+	WERR (*process)(W d, VP handle);
+	VOID (*finish)(VP handle);
+};
+
+struct txf_tx_workarea {
+	W fd;
+	W size;
+	struct txf_header h;
+};
 
 LOCAL WERR send_block(W d, VP buf, W size)
 {
@@ -44,128 +58,6 @@ LOCAL WERR recv_block(W d, VP buf, W size)
 	}
 
 	return pos;
-}
-
-LOCAL W client(W fd, struct sockaddr_in *addr)
-{
-	WERR err;
-	LINK l;
-	W i, f, size, remain;
-	struct txf_header h;
-	B buf[BLOCKSIZE];
-	TC tmp[FILENAME_LEN + 1];
-
-	printf("* client\n");
-
-	/* connect to server */
-	if (so_connect(fd, (struct sockaddr *)addr, sizeof(*addr)) < 0) {
-		printf("client: connect\n");
-		goto fin0;
-	}
-
-	printf("connected to %s\n", inet_ntoa(addr->sin_addr));
-
-	/* receive header */
-	if (recv_block(fd, &h, sizeof(h)) < sizeof(h)) {
-		printf("client: recv_block (header)\n");
-		goto fin0;
-	}
-
-	if (ntohl(h.magic) != MAGIC_SEND) {
-		printf("client: invalid header\n");
-		goto fin0;
-	}
-
-	h.filename_term = '\0';
-	size = ntohl(h.filesize);
-	eucstotcs(tmp, h.filename);
-
-	printf("%S, %d byte\n", tmp, size);
-
-	/* receive file */
-	if ((err = get_lnk(NULL, &l, F_NORM)) < ER_OK) {
-		printf("client: get_lnk\n");
-		goto fin0;
-	}
-
-	if ((err = cre_fil(&l, tmp, NULL, 0, F_FIX)) < ER_OK) {
-		printf("client: cre_fil\n");
-		goto fin0;
-	}
-	f = err;
-
-	/* XXX store as main-TAD record */
-	if ((err = apd_rec(f, NULL, 0, 1, 0, 0)) < ER_OK) {
-		printf("client: apd_rec\n");
-		goto fin1;
-	}
-
-	if ((err = see_rec(f, -1, -1, NULL)) < ER_OK) {
-		printf("client: see_rec\n");
-		goto fin1;
-	}
-
-	for (i = 0; i < size; i += BLOCKSIZE) {
-		remain = size - i;
-		if (remain > BLOCKSIZE)
-			remain = BLOCKSIZE;
-
-		if (recv_block(fd, buf, remain) < remain) {
-			printf("client: recv_block (data)\n");
-			goto fin1;
-		}
-
-		if ((err = wri_rec(f, i, buf, remain, NULL, NULL, 0)) < ER_OK) {
-			printf("client: wri_rec\n");
-			goto fin1;
-		}
-	}
-
-	/* send ack */
-	h.magic = htonl(MAGIC_RCVD);
-	if (send_block(fd, &h, sizeof(h)) < sizeof(h)) {
-		printf("client: send_block (ack)\n");
-		goto fin1;
-	}
-
-fin1:
-	cls_fil(f);
-fin0:
-	return 0;
-}
-
-/* convert pathname */
-LOCAL VOID convert_path(TC *out, TC *in, W maxlen)
-{
-	W len;
-
-	len = tc_strlen(in);
-	if (len > maxlen - 1)
-		len = maxlen - 1;
-
-	while (len-- > 0) {
-		switch (*in) {
-		case TK_SLSH:
-			*out = TC_FDLM;
-			break;
-		case TK_COLN:
-			*out = TC_FSEP;
-			break;
-		case TK_PCNT:
-			in++;
-			len--;
-			if (len > 0)
-				*out = *in;
-			break;
-		default:
-			*out = *in;
-			break;
-		}
-		in++;
-		out++;
-	}
-
-	*out = TK_NULL;
 }
 
 LOCAL W get_filename(TC *filename_tc, B *filename_ascii)
@@ -205,57 +97,311 @@ LOCAL W get_filename(TC *filename_tc, B *filename_ascii)
 	return strlen(filename_ascii);
 }
 
-LOCAL W server(W fd, struct sockaddr_in *addr, TC *filename)
+/* convert pathname */
+LOCAL VOID convert_path(TC *out, TC *in, W maxlen)
+{
+	W len;
+
+	len = tc_strlen(in);
+	if (len > maxlen - 1)
+		len = maxlen - 1;
+
+	while (len-- > 0) {
+		switch (*in) {
+		case TK_SLSH:
+			*out = TC_FDLM;
+			break;
+		case TK_COLN:
+			*out = TC_FSEP;
+			break;
+		case TK_PCNT:
+			in++;
+			len--;
+			if (len > 0)
+				*out = *in;
+			break;
+		default:
+			*out = *in;
+			break;
+		}
+		in++;
+		out++;
+	}
+
+	*out = TK_NULL;
+}
+
+LOCAL VP rx_init(TC *arg)
+{
+	/* do nothing */
+	return rx_init;
+}
+
+LOCAL WERR rx_process(W fd, VP handle)
 {
 	WERR err;
-	W d, f;
 	LINK l;
-	W i, size, remain;
-	B buf[BLOCKSIZE];
+	W i, f, size, remain;
 	struct txf_header h;
-	struct sockaddr_in peer;
-	W peer_len;
+	B buf[BLOCKSIZE];
+	TC tmp[FILENAME_LEN + 1];
+
+	/* receive header */
+	if (recv_block(fd, &h, sizeof(h)) < sizeof(h)) {
+		printf("rx_process: recv_block (header)\n");
+		err = ER_IO;
+		goto fin0;
+	}
+
+	if (ntohl(h.magic) != MAGIC_SEND) {
+		printf("rx_process: invalid header\n");
+		err = ER_OBJ;
+		goto fin0;
+	}
+
+	h.filename_term = '\0';
+	size = ntohl(h.filesize);
+	eucstotcs(tmp, h.filename);
+
+	printf("%S, %d byte\n", tmp, size);
+
+	/* receive file */
+	if ((err = get_lnk(NULL, &l, F_NORM)) < ER_OK) {
+		printf("rx_process: get_lnk\n");
+		goto fin0;
+	}
+
+	if ((err = cre_fil(&l, tmp, NULL, 0, F_FIX)) < ER_OK) {
+		printf("rx_process: cre_fil\n");
+		goto fin0;
+	}
+	f = err;
+
+	/* XXX store as main-TAD record */
+	if ((err = apd_rec(f, NULL, 0, 1, 0, 0)) < ER_OK) {
+		printf("rx_process: apd_rec\n");
+		goto fin1;
+	}
+
+	if ((err = see_rec(f, -1, -1, NULL)) < ER_OK) {
+		printf("rx_process: see_rec\n");
+		goto fin1;
+	}
+
+	for (i = 0; i < size; i += BLOCKSIZE) {
+		remain = size - i;
+		if (remain > BLOCKSIZE)
+			remain = BLOCKSIZE;
+
+		if (recv_block(fd, buf, remain) < remain) {
+			printf("rx_process: recv_block (data)\n");
+			err = ER_IO;
+			goto fin1;
+		}
+
+		if ((err = wri_rec(f, i, buf, remain, NULL, NULL, 0)) < ER_OK) {
+			printf("rx_process: wri_rec\n");
+			goto fin1;
+		}
+	}
+
+	/* send ack */
+	h.magic = htonl(MAGIC_RCVD);
+	if (send_block(fd, &h, sizeof(h)) < sizeof(h)) {
+		printf("rx_process: send_block (ack)\n");
+		err = ER_IO;
+		goto fin1;
+	}
+
+	err = ER_OK;
+fin1:
+	cls_fil(f);
+fin0:
+	return err;
+}
+
+LOCAL void rx_finish(VP handle)
+{
+	/* do nothing */
+}
+
+LOCAL VP tx_init(TC *filename)
+{
+	struct txf_tx_workarea *wk;
+	WERR err;
+	W f, size;
+	LINK l;
 	TC path[L_PATHNM];
 	B fn[FILENAME_LEN + 1];
 
-	printf("* server\n");
+	wk = malloc(sizeof(*wk));
+	if (wk == NULL) {
+		printf("tx_init: malloc\n");
+		err = ER_NOMEM;
+		goto fin0;
+	}
 
 	convert_path(path, filename, L_PATHNM);
 
 	/* file open */
 	if (get_filename(path, fn) < 1) {
-		printf("server: invalid file name\n");
-		goto fin0;
+		printf("tx_init: invalid file name\n");
+		err = ER_PAR;
+		goto fin1;
 	}
 
 	if ((err = get_lnk(path, &l, F_NORM)) < ER_OK) {
-		printf("server: get_lnk\n");
-		goto fin0;
+		printf("tx_init: get_lnk\n");
+		goto fin1;
 	}
 
 	if ((err = opn_fil(&l, F_READ | F_EXCL, NULL)) < ER_OK) {
-		printf("server: opn_fil\n");
-		goto fin0;
+		printf("tx_init: opn_fil\n");
+		goto fin1;
 	}
 	f = err;
 
 	/* find main-TAD record */
-	if ((err = fnd_rec(f, F_TOPEND, (1 << 1), 0, NULL)) >= ER_OK)
-		printf("server: main TAD record\n");
-	else if ((err = see_rec(f, 0, 1, NULL)) >= ER_OK)
+	if ((err = fnd_rec(f, F_TOPEND, (1 << 1), 0, NULL)) >= ER_OK) {
+		printf("tx_init: main TAD record\n");
+	} else if ((err = see_rec(f, 0, 1, NULL)) >= ER_OK) {
 		/* no main-TAD record; use top record */
-		printf("server: top record\n");
-	else {
-		printf("server: see_rec\n");
-		goto fin1;
+		printf("tx_init: top record\n");
+	} else {
+		printf("tx_init: see_rec\n");
+		goto fin2;
 	}
 
 	if ((err = rea_rec(f, 0, NULL, 0, &size, NULL)) < ER_OK) {
-		printf("server: rea_rec (filesize)\n");
+		printf("tx_init: rea_rec (filesize)\n");
+		goto fin2;
+	}
+
+	/* store file information to workarea */
+	wk->fd = f;
+	wk->size = size;
+
+	memset(&wk->h, 0, sizeof(wk->h));
+	wk->h.magic = htonl(MAGIC_SEND);
+	wk->h.filesize = htonl(size);
+	strcpy(wk->h.filename, fn);
+
+	printf("%s, %d byte\n", fn, size);
+	goto fin0;
+
+fin2:
+	cls_fil(f);
+fin1:
+	free(wk);
+	wk = NULL;
+fin0:
+	return wk;
+}
+
+LOCAL WERR tx_process(W d, VP handle)
+{
+	struct txf_tx_workarea *wk = handle;
+	W i, remain;
+	struct txf_header h;
+	B buf[BLOCKSIZE];
+	WERR err;
+
+	/* send header */
+	if (send_block(d, &wk->h, sizeof(wk->h)) < sizeof(wk->h)) {
+		printf("tx_process: send_block (header)\n");
+		err = ER_IO;
+		goto fin0;
+	}
+
+	/* send file */
+	for (i = 0; i < wk->size; i += BLOCKSIZE) {
+		remain = wk->size - i;
+		if (remain > BLOCKSIZE)
+			remain = BLOCKSIZE;
+
+		if ((err = rea_rec(wk->fd, i, buf, remain, NULL, NULL)) < ER_OK) {
+			printf("tx_process: rea_rec (data)\n");
+			goto fin0;
+		}
+
+		if (send_block(d, buf, remain) < remain) {
+			printf("tx_process: send_block (data)\n");
+			err = ER_IO;
+			goto fin0;
+		}
+	}
+
+	/* receive ack */
+	if (recv_block(d, &h, sizeof(h)) < sizeof(h)) {
+		printf("tx_process: recv_block (ack)\n");
+		err = ER_IO;
+		goto fin0;
+	}
+
+	if (ntohl(h.magic) != MAGIC_RCVD) {
+		printf("tx_process: invalid ack\n");
+		err = ER_OBJ;
+		goto fin0;
+	}
+
+	err = ER_OK;
+fin0:
+	return err;
+}
+
+LOCAL VOID tx_finish(VP handle)
+{
+	struct txf_tx_workarea *wk = handle;
+
+	cls_fil(wk->fd);
+	free(handle);
+}
+
+LOCAL WERR client(W fd, struct sockaddr_in *addr, TC *arg, struct txf_workingset *work)
+{
+	VP handle;
+	WERR err = ER_IO;
+
+	printf("* client\n");
+
+	if ((handle = (*work->init)(arg)) == NULL) {
+		printf("client: init\n");
+		goto fin0;
+	}
+
+	/* connect to server */
+	if (so_connect(fd, (struct sockaddr *)addr, sizeof(*addr)) < 0) {
+		printf("client: connect\n");
 		goto fin1;
 	}
 
-	printf("%s, %d byte\n", fn, size);
+	printf("connected to %s\n", inet_ntoa(addr->sin_addr));
+
+	if ((*work->process)(fd, handle)) {
+		printf("client: process\n");
+		goto fin1;
+	}
+
+	err = ER_OK;
+fin1:
+	(*work->finish)(handle);
+fin0:
+	return err;
+}
+
+LOCAL W server(W fd, struct sockaddr_in *addr, TC *arg, struct txf_workingset *work)
+{
+	VP handle;
+	WERR err = ER_IO;
+	W d, peer_len;
+	struct sockaddr_in peer;
+
+	printf("* server\n");
+
+	if ((handle = (*work->init)(arg)) == NULL) {
+		printf("server: init\n");
+		goto fin0;
+	}
 
 	/* wait for connect */
 	if (so_bind(fd, (struct sockaddr *)addr, sizeof(*addr)) < 0) {
@@ -276,60 +422,30 @@ LOCAL W server(W fd, struct sockaddr_in *addr, TC *filename)
 
 	printf("connected from %s\n", inet_ntoa(peer.sin_addr));
 
-	/* send header */
-	memset(&h, 0, sizeof(h));
-	h.magic = htonl(MAGIC_SEND);
-	h.filesize = htonl(size);
-	strcpy(h.filename, fn);
-
-	if (send_block(d, &h, sizeof(h)) < sizeof(h)) {
-		printf("server: send_block (header)\n");
+	if ((*work->process)(d, handle)) {
+		printf("server: process\n");
 		goto fin2;
 	}
 
-	/* send file */
-	for (i = 0; i < size; i += BLOCKSIZE) {
-		remain = size - i;
-		if (remain > BLOCKSIZE)
-			remain = BLOCKSIZE;
-
-		if ((err = rea_rec(f, i, buf, remain, NULL, NULL)) < ER_OK) {
-			printf("server: rea_rec (data)\n");
-			goto fin2;
-		}
-
-		if (send_block(d, buf, remain) < remain) {
-			printf("server: send_block (data)\n");
-			goto fin2;
-		}
-	}
-
-	/* receive ack */
-	if (recv_block(d, &h, sizeof(h)) < sizeof(h)) {
-		printf("server: recv_block (ack)\n");
-		goto fin2;
-	}
-
-	if (ntohl(h.magic) != MAGIC_RCVD) {
-		printf("server: invalid ack\n");
-		goto fin2;
-	}
-
+	err = ER_OK;
 fin2:
 	so_close(d);
 fin1:
-	cls_fil(f);
+	(*work->finish)(handle);
 fin0:
-	return 0;
+	return err;
 }
 
 EXPORT W main(W argc, TC *argv[])
 {
 	WERR fd;
+	W tx_file, rx_server, port;
 	struct sockaddr_in addr;
+	struct txf_workingset rx_set = {rx_init, rx_process, rx_finish};
+	struct txf_workingset tx_set = {tx_init, tx_process, tx_finish};
 	B tmp[256];
 
-	if (argc < 3) {
+	if (argc < 3 || argc > 4) {
 		printf("%S [ipv4-addr] [port] [(filename to send)]\n",
 		       argv[0]);
 		goto fin0;
@@ -340,16 +456,38 @@ EXPORT W main(W argc, TC *argv[])
 		goto fin0;
 	}
 
+	/* default: tx-server/rx-client mode */
+	port = tc_atoi(argv[2]);
+	tx_file = (argc == 4) ? 1 : 0;
+	rx_server = 0;
+
+	/* if port is negative, rx-server/tx-client mode */
+	if (*argv[2] == TK_MINS) {
+		port = -port;
+		tx_file ^= 1;
+		rx_server = 1;
+	}
+
 	tcstoeucs(tmp, argv[1]);
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = inet_addr(tmp);
-	addr.sin_port = htons(tc_atoi(argv[2]));
+	addr.sin_port = htons(port);
 
-	if (argc == 3)
-		client(fd, &addr);
-	else if (argc == 4)
-		server(fd, &addr, argv[3]);
+	switch ((rx_server << 1) | tx_file) {
+	case 0:
+		client(fd, &addr, NULL, &rx_set);
+		break;
+	case 1:
+		server(fd, &addr, argv[3], &tx_set);
+		break;
+	case 2:
+		client(fd, &addr, argv[3], &tx_set);
+		break;
+	case 3:
+		server(fd, &addr, NULL, &rx_set);
+		break;
+	}
 
 	so_close(fd);
 fin0:
