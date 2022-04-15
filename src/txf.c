@@ -409,6 +409,12 @@ LOCAL W server(W fd, struct sockaddr_in *addr, TC *arg, struct txf_workingset *w
 		goto fin1;
 	}
 
+	peer_len = sizeof(peer);
+	if (so_getsockname(fd, (struct sockaddr *)&peer, &peer_len) >= 0) {
+		printf("address %s port %d\n",
+		       inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
+	}
+
 	if (so_listen(fd, 1) < 0) {
 		printf("server: listen\n");
 		goto fin1;
@@ -420,7 +426,8 @@ LOCAL W server(W fd, struct sockaddr_in *addr, TC *arg, struct txf_workingset *w
 		goto fin1;
 	}
 
-	printf("connected from %s\n", inet_ntoa(peer.sin_addr));
+	printf("connected from %s port %d\n",
+	       inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
 
 	if ((*work->process)(d, handle)) {
 		printf("server: process\n");
