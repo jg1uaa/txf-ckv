@@ -393,7 +393,7 @@ LOCAL W server(W fd, struct sockaddr_in *addr, TC *arg, struct txf_workingset *w
 {
 	VP handle;
 	WERR err = ER_IO;
-	W d, peer_len;
+	W d, en = 1, peer_len;
 	struct sockaddr_in peer;
 
 	printf("* server\n");
@@ -404,6 +404,7 @@ LOCAL W server(W fd, struct sockaddr_in *addr, TC *arg, struct txf_workingset *w
 	}
 
 	/* wait for connect */
+	so_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (B *)&en, sizeof(en));
 	if (so_bind(fd, (struct sockaddr *)addr, sizeof(*addr)) < 0) {
 		printf("server: bind\n");
 		goto fin1;
